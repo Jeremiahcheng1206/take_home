@@ -1,41 +1,40 @@
-# PaySim Fraud Detection Case Study
+# PaySim Fraud Detection Case Study — Short README
+
+## Objective
+Build a transaction-level suspicious-activity scoring workflow for the PaySim dataset under severe class imbalance, while keeping false positives operationally manageable.
 
 ## Approach
-The workflow was designed to balance **predictive performance**, **leakage control**, and **operational usability**.
+The modeling workflow emphasized leakage control, time-aware evaluation, and operational thresholding.
 
-### 1. Data review and leakage controls
-I first reviewed class imbalance, fraud by transaction type, time structure, and candidate feature behavior.  
-Several columns were intentionally excluded or treated carefully:
+The final feature set was built from:
+- transaction type
+- log-transformed transaction amount
+- timeline position (`step`)
+- hour-of-day
+- destination / origin novelty indicators
+- prior entity transaction-count features
 
-- `isFlaggedFraud` was excluded because it behaves like a narrow pre-existing alert rather than a neutral predictor.
-- `nameOrig` and `nameDest` were not used directly to avoid memorization / identity leakage.
-- Historical behavioral features were constructed only from prior activity.
+To reduce leakage risk, the primary model excluded:
+- `oldbalanceOrg`
+- `newbalanceOrig`
+- `oldbalanceDest`
+- `newbalanceDest`
 
-A **time-based split** was used instead of a random split:
-- final **7 days** reserved as holdout
-- earlier period used for training / tuning
+Raw identifiers (`nameOrig`, `nameDest`) were also not used directly. Instead, they were used only to derive prior-history and first-seen features.
 
-### 2. Baseline model
-A simple **logistic regression** baseline was built using:
+A time-based split was used:
+- **train** for model fitting / tuning
+- **validation** for model selection and threshold selection
+- **holdout** for final one-time reporting
+
+## Models
+### Baseline
+The baseline was a **logistic regression** using:
 - `step`
 - `type`
 - `log_amount`
 
-This provided an interpretable benchmark and confirmed that even simple transaction-level features contain useful signal.
-
-### 3. Feature engineering and selection
-Candidate behavioral features were created and screened, including:
-- `hour_of_day`
-- first-seen indicators
-- prior transaction counts
-- recent 24-hour counts
-
-For the logistic benchmark, I selected a compact set that balanced:
-- interpretability
-- incremental lift
-- low redundancy
-
-The strongest logistic model used:
+Candidate feature blocks were then added in a structured way. The best logistic model used:
 - `step`
 - `type`
 - `log_amount`
@@ -45,51 +44,84 @@ The strongest logistic model used:
 - `log_orig_prior_tx_count`
 - `log_dest_prior_tx_count`
 
-### 4. Advanced model
-I then trained an **XGBoost** model on the same feature family.
+The logistic threshold was selected on validation and then locked before holdout testing.
 
-Hyperparameter tuning used a two-stage process:
-1. **Random search** with rolling time-based cross-validation
-2. **Narrowed grid search** on the most influential parameters (`max_depth`, `learning_rate`, `n_estimators`, `subsample`)
+### Advanced model
+The advanced model was **XGBoost**. Tuning used:
+1. random search with rolling time-based CV inside the training set,
+2. stability filtering using fold variability and train-validation gap,
+3. a narrowed grid search around the strongest stable candidates,
+4. validation-based comparison of the top candidates,
+5. validation-based threshold selection.
 
-To reduce variance and avoid unstable settings, candidates were filtered using:
-- `test_pr_auc_range` = max fold PR AUC − min fold PR AUC
-- `relative_gap` = (mean train PR AUC − mean test PR AUC) / mean test PR AUC
+The final XGBoost candidate used:
+- `max_depth = 4`
+- `learning_rate = 0.05`
+- `n_estimators = 400`
+- `subsample = 1.0`
+- `colsample_bytree = 0.7`
+- `colsample_bylevel = 0.8`
+- `gamma = 0.5`
 
-This favored candidates that were both strong and temporally stable.
+The selected threshold was **0.93**.
 
-### 5. Threshold selection
-Both the logistic model and XGBoost were first evaluated as ranking models, then converted into alerting systems using threshold analysis based on:
-- precision / recall
-- F1 / F2
-- alert volume / alert rate
+## Key trade-offs
+The main trade-off was **recall vs operational burden**. Lower thresholds increased recall but created many more alerts and false positives. Thresholds were therefore selected using validation-based operational metrics rather than a default 0.5 cutoff.
+
+I tracked:
+- PR AUC as the primary ranking metric
+- ROC AUC as a secondary ranking metric
 - expected cost
+- alert volume
+- incremental alerts against the negative class
+- false omission rate
 
-I did not use a default 0.5 threshold because the business objective is asymmetric:
-- false negatives are much more costly than false positives
+The cost function used:
+- **FN = 500**
+- **FP = 5**
 
----
+## Final holdout results
+### Best Logistic Regression
+- ROC AUC: **0.9510**
+- PR AUC: **0.4532**
+- Precision: **0.0508**
+- Recall: **0.9256**
+- F2: **0.2082**
+- Alert volume: **33,803**
+- Expected cost: **229,435**
 
-## Key Results
-| Model | ROC AUC | PR AUC |
-|---|---:|---:|
-| Best Logistic Regression | 0.9510 | 0.4532 |
-| Final XGBoost | 0.9708 | 0.6352 |
+### Final XGBoost
+- ROC AUC: **0.9726**
+- PR AUC: **0.6406**
+- Precision: **0.2608**
+- Recall: **0.8339**
+- F2: **0.5792**
+- Alert volume: **5,929**
+- Expected cost: **175,915**
 
-The final XGBoost model delivered a **material improvement**, especially in **PR AUC**, indicating that non-linear interactions among transaction, temporal, and behavioral-history features are important.
+Overall, XGBoost materially outperformed the logistic benchmark on holdout. It achieved much stronger ranking quality, substantially higher precision, far lower alert volume, and lower expected cost.
 
----
+## Model interpretation and practical findings
+SHAP analysis showed that the final XGBoost model was driven primarily by:
+- transaction type
+- transaction amount
+- destination novelty
+- destination-side prior history
+- temporal structure (`step` and `hour_of_day`)
 
-## Main Trade-offs
-- **Interpretability vs performance:** logistic regression was easier to explain, but XGBoost produced much stronger ranking performance.
-- **Feature richness vs practicality:** I screened a broader candidate pool, but kept the main benchmark feature set compact to reduce redundancy and keep the notebook readable.
-- **Search breadth vs compute:** the advanced-model tuning was narrowed in a structured way so it remained practical on local compute while still covering the most important hyperparameters.
+The top 20 highest-risk holdout transactions were all true frauds, with precision **1.00** in that top-risk slice. These cases were dominated by large `CASH_OUT` transactions, often with sparse prior history and first-seen destination patterns.
 
----
+Segment analysis showed the model was strongest in the most relevant groups:
+- strongest type-level performance in `TRANSFER` / `CASH_OUT`
+- better performance when `dest_is_first_seen = 1`
+- strongest performance in the highest transaction-amount band
 
-## Next Steps
-If more time or compute were available, the next extensions would be:
-- richer amount-based behavioral features
-- additional rolling time windows
-- SHAP-based interpretation of the final XGBoost model
-- deeper threshold-stability analysis across time slices
+## Conclusion
+The final workflow combined:
+- leakage-aware feature engineering
+- time-based validation
+- interpretable benchmarking
+- stability-aware XGBoost tuning
+- business-oriented threshold selection
+
+The final XGBoost model provided the best balance of ranking quality and operational usability on the holdout set.
